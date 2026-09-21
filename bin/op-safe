@@ -1,0 +1,100 @@
+#!/usr/bin/env bash
+# op-safe: serializing wrapper around the 1Password CLI (op).
+#
+# Fixes two real failure modes observed in 1Password_rCURRENT.log:
+#  1) Concurrent/bursty `op` calls queue authorization prompts that 1Password
+#     serializes, stall, and auto-cancel (AppCancel / SystemAuthError /
+#     NoNewAccountsUnlocked). Fix: a global inter-process lock so only one
+#     `op` invocation runs at a time.
+#  2) After 1Password auto-updates, the main process stays alive but deaf
+#     (flags --silent --just-updated --should-restart); the socket exists
+#     but nothing answers, so `op` gets an authorization timeout. Fix:
+#     detect the flag and quit+relaunch the app before calling op.
+#
+# NEVER logs op's stdout/stderr content (may contain secrets) - only the
+# subcommand name, exit code, and whether a known error pattern matched.
+
+set -uo pipefail
+
+LOCK_DIR="${TMPDIR:-/tmp}/.op-safe.lock"
+STALE_SECONDS=180
+MAX_ITERATIONS=600   # 600 * 0.2s = 120s max wait
+LOG_FILE="$HOME/.claude/logs/op-safe.log"
+APP_BIN="/Applications/1Password.app/Contents/MacOS/1Password"
+
+mkdir -p "$(dirname "$LOG_FILE")"
+
+log() {
+    printf '%s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*" >> "$LOG_FILE"
+}
+
+sub="${1:-none}"
+
+# --- acquire global lock (mkdir is atomic on macOS; no flock available) ---
+i=0
+while ! mkdir "$LOCK_DIR" 2>/dev/null; do
+    if [ -d "$LOCK_DIR" ]; then
+        lock_mtime=$(stat -f %m "$LOCK_DIR" 2>/dev/null || echo 0)
+        now=$(date +%s)
+        lock_age=$(( now - lock_mtime ))
+        if [ "$lock_age" -gt "$STALE_SECONDS" ]; then
+            log "lock stale (age=${lock_age}s), removing; subcommand=${sub}"
+            rmdir "$LOCK_DIR" 2>/dev/null || true
+            continue
+        fi
+    fi
+    i=$((i + 1))
+    if [ "$i" -ge "$MAX_ITERATIONS" ]; then
+        log "lock wait timeout after 120s; subcommand=${sub}"
+        echo "op-safe: timed out waiting for the 1Password lock" >&2
+        exit 75
+    fi
+    sleep 0.2
+done
+
+# Release the lock on any exit path (no `exec` below, so this always fires).
+trap 'rmdir "$LOCK_DIR" 2>/dev/null || true' EXIT
+
+# --- auto-repair fallback 2: deaf process after auto-update ---
+if pgrep -fl "$APP_BIN" 2>/dev/null | grep -q -- '--just-updated'; then
+    log "detected --just-updated flag, healing bridge; subcommand=${sub}"
+    osascript -e 'tell application "1Password" to quit' >/dev/null 2>&1 || true
+    sleep 5
+    open -a "1Password"
+    sleep 20
+    log "heal complete, relaunched 1Password; subcommand=${sub}"
+fi
+
+# --- run op, capturing only stderr (to a temp file) to pattern-match ---
+run_op() {
+    local err_file rc
+    err_file=$(mktemp "${TMPDIR:-/tmp}/op-safe-err.XXXXXX")
+    op "$@" 2> >(tee "$err_file" >&2)
+    rc=$?
+    wait 2>/dev/null || true
+    LAST_ERR=$(cat "$err_file" 2>/dev/null || true)
+    rm -f "$err_file"
+    return $rc
+}
+
+run_op "$@"
+ec=$?
+
+if [ "$ec" -ne 0 ]; then
+    case "$LAST_ERR" in
+        *"couldn't connect to the 1Password desktop app"*|*"authorization timeout"*)
+            log "op failed subcommand=${sub} exit=${ec} pattern=bridge_error; retrying once in 10s"
+            sleep 10
+            run_op "$@"
+            ec=$?
+            log "retry result subcommand=${sub} exit=${ec}"
+            ;;
+        *)
+            log "op failed subcommand=${sub} exit=${ec} pattern=none"
+            ;;
+    esac
+else
+    log "op ok subcommand=${sub} exit=${ec}"
+fi
+
+exit "$ec"

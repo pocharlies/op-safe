@@ -1,15 +1,26 @@
 #!/usr/bin/env bash
 # op-safe: serializing wrapper around the 1Password CLI (op).
 #
-# Fixes two real failure modes observed in 1Password_rCURRENT.log:
+# Fixes three real failure modes observed in 1Password_rCURRENT.log:
 #  1) Concurrent/bursty `op` calls queue authorization prompts that 1Password
 #     serializes, stall, and auto-cancel (AppCancel / SystemAuthError /
 #     NoNewAccountsUnlocked). Fix: a global inter-process lock so only one
 #     `op` invocation runs at a time.
 #  2) After 1Password auto-updates, the main process stays alive but deaf
 #     (flags --silent --just-updated --should-restart); the socket exists
-#     but nothing answers, so `op` gets an authorization timeout. Fix:
-#     detect the flag and quit+relaunch the app before calling op.
+#     but nothing answers, so `op` hangs and then gets an authorization
+#     timeout. Fix: heal the bridge (quit + relaunch the app) and retry.
+#  3) A prompt nobody is there to approve (locked Mac, or the app saturated
+#     with pending prompts) fails as "authorization prompt dismissed". No
+#     restart fixes that - a human has to approve. Labelled, never healed.
+#
+# The heal is REACTIVE, never preemptive, because the --just-updated flag is
+# NOT evidence of a deaf app: measured 2026-09-22 on a Mac whose 1Password had
+# auto-updated, the flag survived several quit+relaunch cycles (same PID kept
+# it) while plain `op vault list` answered correctly in 5s. Healing on the flag
+# alone restarted the app and burned ~25-45s on EVERY call, healthy or not.
+# So: call op first, heal only when op actually fails, and bound op with a
+# timeout so a deaf app (which hangs rather than erroring) still gets healed.
 #
 # NEVER logs op's stdout/stderr content (may contain secrets) - only the
 # subcommand name, exit code, and whether a known error pattern matched.
@@ -20,7 +31,18 @@ LOCK_DIR="${TMPDIR:-/tmp}/.op-safe.lock"
 STALE_SECONDS=180
 MAX_ITERATIONS=600   # 600 * 0.2s = 120s max wait
 LOG_FILE="$HOME/.claude/logs/op-safe.log"
-APP_BIN="/Applications/1Password.app/Contents/MacOS/1Password"
+APP_BIN="${OP_SAFE_APP_BIN:-/Applications/1Password.app/Contents/MacOS/1Password}"
+APP_NAME="${OP_SAFE_APP_NAME:-1Password}"
+
+# How long to wait for one `op` invocation before declaring the app deaf.
+# Generous on purpose: a real Touch ID prompt waiting for a human looks
+# exactly like a hang. 0 disables the cap (a hanging op is then never healed
+# by timeout - an op that returns a bridge error still is).
+OP_TIMEOUT="${OP_SAFE_OP_TIMEOUT:-120}"
+# Never quit+relaunch more than once per this window: a failing burst would
+# otherwise restart the app per call.
+HEAL_COOLDOWN="${OP_SAFE_HEAL_COOLDOWN:-120}"
+HEAL_MARKER="${TMPDIR:-/tmp}/.op-safe.last-heal"
 
 mkdir -p "$(dirname "$LOG_FILE")"
 
@@ -55,21 +77,32 @@ done
 # Release the lock on any exit path (no `exec` below, so this always fires).
 trap 'rmdir "$LOCK_DIR" 2>/dev/null || true' EXIT
 
-# --- auto-repair fallback 2: deaf process after auto-update ---
-if pgrep -fl "$APP_BIN" 2>/dev/null | grep -q -- '--just-updated'; then
-    log "detected --just-updated flag, healing bridge; subcommand=${sub}"
-    osascript -e 'tell application "1Password" to quit' >/dev/null 2>&1 || true
-    sleep 5
-    open -a "1Password"
-    sleep 20
-    log "heal complete, relaunched 1Password; subcommand=${sub}"
-fi
-
-# --- run op, capturing only stderr (to a temp file) to pattern-match ---
+# --- run op, bounded by OP_TIMEOUT, capturing only stderr to pattern-match ---
+# macOS has no timeout(1) (and no gtimeout unless coreutils is installed), so
+# the alarm lives in perl, which always ships with macOS. stdout is passed
+# through untouched: op-safe must never buffer or log a secret.
 run_op() {
     local err_file rc
     err_file=$(mktemp "${TMPDIR:-/tmp}/op-safe-err.XXXXXX")
-    op "$@" 2> >(tee "$err_file" >&2)
+    perl -e '
+        my $t = shift @ARGV;
+        my $pid = fork();
+        die "op-safe: fork failed: $!" unless defined $pid;
+        if ($pid == 0) { exec @ARGV or exit 127; }
+        my $killed = 0;
+        local $SIG{ALRM} = sub {
+            $killed = 1;
+            kill "TERM", $pid; kill "KILL", $pid;
+        };
+        alarm $t if $t > 0;
+        waitpid $pid, 0;
+        alarm 0;
+        exit 124 if $killed;
+        my $status = $?;
+        exit($status >> 8) if ($status >> 8) > 0;   # the exit code op returned
+        exit 1 if ($status & 127);                  # killed by another signal
+        exit 0;
+    ' "$OP_TIMEOUT" op "$@" 2> >(tee "$err_file" >&2)
     rc=$?
     wait 2>/dev/null || true
     LAST_ERR=$(cat "$err_file" 2>/dev/null || true)
@@ -77,24 +110,97 @@ run_op() {
     return $rc
 }
 
+# Classify a failure. Never matches a value, only op's own error strings.
+#   bridge_error   -> the app is unreachable/deaf: healing can help
+#   timeout        -> op never answered: the deaf-app signature, heal it
+#   prompt_pending -> a human has to approve: healing would only lose the prompt
+#   none           -> an ordinary op error (bad item name, no permission, ...)
+classify_failure() {
+    local err="$1" ec="$2"
+    if [ "$ec" -eq 124 ]; then echo timeout; return; fi
+    case "$err" in
+        *"couldn't connect to the 1Password desktop app"*) echo bridge_error; return ;;
+        *"authorization timeout"*)                         echo bridge_error; return ;;
+        *"NoNewAccountsUnlocked"*)                         echo bridge_error; return ;;
+        *"AppCancel"*)                                     echo bridge_error; return ;;
+        *"SystemAuthError"*)                               echo bridge_error; return ;;
+        *"authorization prompt dismissed"*)                echo prompt_pending; return ;;
+    esac
+    echo none
+}
+
+main_pid() { pgrep -f "^$APP_BIN" 2>/dev/null | head -1; }
+
+# Quit + relaunch the app. Skipped if we healed very recently.
+heal_bridge() {
+    local now age flag="absent" pid newpid attempt
+    if [ -f "$HEAL_MARKER" ]; then
+        now=$(date +%s)
+        age=$(( now - $(stat -f %m "$HEAL_MARKER" 2>/dev/null || echo 0) ))
+        if [ "$age" -lt "$HEAL_COOLDOWN" ]; then
+            log "heal skipped (last heal ${age}s ago < cooldown ${HEAL_COOLDOWN}s); subcommand=${sub}"
+            return 0
+        fi
+    fi
+    pgrep -fl "$APP_BIN" 2>/dev/null | grep -q -- '--just-updated' && flag="present"
+    pid="$(main_pid)"
+    log "healing 1Password bridge (just-updated flag=${flag}, pid=${pid:-none}); subcommand=${sub}"
+
+    if [ -n "$pid" ]; then
+        # An Apple Event quit is the polite route, but it silently does nothing
+        # when op-safe runs from a non-GUI context (measured 2026-09-22 over
+        # ssh: the PID survived every osascript quit). Fall back to SIGTERM,
+        # which the same user can always send, and verify instead of assuming.
+        osascript -e "tell application \"$APP_NAME\" to quit" >/dev/null 2>&1 || true
+        for attempt in 1 2 3 4 5 6 7 8 9 10; do
+            kill -0 "$pid" 2>/dev/null || break
+            sleep 1
+        done
+        if kill -0 "$pid" 2>/dev/null; then
+            log "osascript quit did not take; sending SIGTERM to pid ${pid}; subcommand=${sub}"
+            kill -TERM "$pid" 2>/dev/null || true
+            for attempt in 1 2 3 4 5; do
+                kill -0 "$pid" 2>/dev/null || break
+                sleep 1
+            done
+        fi
+    fi
+
+    open -a "$APP_NAME" >/dev/null 2>&1 || true
+    sleep 20
+    : > "$HEAL_MARKER" 2>/dev/null || true
+    newpid="$(main_pid)"
+    if [ -n "$newpid" ] && [ "$newpid" != "$pid" ]; then
+        log "heal complete, relaunched $APP_NAME (pid ${pid:-none} -> ${newpid}); subcommand=${sub}"
+    else
+        # If the PID did not change the app was never restarted: say so loudly,
+        # because a heal that does not heal is worse than none.
+        log "heal INEFFECTIVE: $APP_NAME pid unchanged (${pid:-none}); subcommand=${sub}"
+    fi
+}
+
 run_op "$@"
 ec=$?
 
-if [ "$ec" -ne 0 ]; then
-    case "$LAST_ERR" in
-        *"couldn't connect to the 1Password desktop app"*|*"authorization timeout"*)
-            log "op failed subcommand=${sub} exit=${ec} pattern=bridge_error; retrying once in 10s"
-            sleep 10
-            run_op "$@"
-            ec=$?
-            log "retry result subcommand=${sub} exit=${ec}"
-            ;;
-        *)
-            log "op failed subcommand=${sub} exit=${ec} pattern=none"
-            ;;
-    esac
-else
+if [ "$ec" -eq 0 ]; then
     log "op ok subcommand=${sub} exit=${ec}"
+    exit 0
 fi
+
+pattern="$(classify_failure "$LAST_ERR" "$ec")"
+log "op failed subcommand=${sub} exit=${ec} pattern=${pattern}"
+
+# Only a deaf app is worth a restart. A dismissed prompt needs a human, and an
+# ordinary op error needs neither - retrying those just queues another prompt.
+if [ "$pattern" != bridge_error ] && [ "$pattern" != timeout ]; then
+    exit "$ec"
+fi
+
+heal_bridge
+run_op "$@"
+ec=$?
+after="$(classify_failure "$LAST_ERR" "$ec")"
+[ "$ec" -eq 0 ] && after=ok
+log "retry result subcommand=${sub} exit=${ec} pattern_after=${after}"
 
 exit "$ec"

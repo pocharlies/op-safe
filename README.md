@@ -72,14 +72,44 @@ A drop-in replacement for `op` that:
   lock would never fire on the way out — the lock directory would be
   orphaned forever, permanently deadlocking every future `op-safe` call. The
   wrapper runs `op` as a child process specifically so the trap always fires.
-- Detects Failure 2 before calling `op`: if the main 1Password process is
-  still running with `--just-updated`, it quits and relaunches the app first.
-- Retries exactly once, after a 10 second pause, if `op` fails with
-  `couldn't connect to the 1Password desktop app` or `authorization timeout`
-  — both are the zombie-app signature, and a relaunch usually clears them.
+- **Bounds `op` with a timeout** (`OP_SAFE_OP_TIMEOUT`, default 120s; `0`
+  disables). macOS ships no `timeout(1)`, so the alarm is a small `perl`
+  wrapper (perl always ships with macOS). A timeout is reported as exit code
+  124. `op`'s stdout is still streamed straight through, never buffered.
+- **Heals Failure 2 *reactively*, never preemptively.** It runs `op` first and
+  only quits + relaunches the app when `op` actually fails with a deaf-app
+  signature — a bridge error (`couldn't connect to the 1Password desktop app`,
+  `authorization timeout`, `AppCancel`, `SystemAuthError`,
+  `NoNewAccountsUnlocked`) or the timeout above — then retries once.
+  - *Why reactive:* the `--just-updated` flag is **not** evidence of a deaf
+    app. Measured 2026-09-22 on a Mac whose 1Password had auto-updated: the
+    flag survived several quit+relaunch cycles (the same PID kept it) while
+    plain `op vault list` answered correctly in 5s. Healing on the flag alone
+    therefore restarted the app and burned 25–45s on **every** call, healthy
+    or not — the wrapper became the thing it was fixing.
+  - *Why a timeout is required:* a genuinely deaf app hangs instead of
+    erroring, so a purely error-driven heal would never fire. The timeout is
+    deliberately generous because a real Touch ID prompt waiting for a human
+    looks identical from here.
+- **Heals at most once per `OP_SAFE_HEAL_COOLDOWN`** (default 120s), so a burst
+  of failing calls cannot restart the app over and over.
+- **Verifies the restart instead of assuming it.** The Apple Event quit
+  (`osascript`) silently does nothing when the wrapper runs from a non-GUI
+  context such as SSH — measured: the PID survived every `osascript quit`. The
+  wrapper falls back to `SIGTERM` (same user, always allowed) and logs
+  `heal complete, relaunched 1Password (pid X -> Y)`; if the PID did not change
+  it logs `heal INEFFECTIVE` rather than pretending.
+- **Does not retry what a restart cannot fix.** `authorization prompt dismissed`
+  is labelled `prompt_pending` and returned as-is: it needs a human at the Mac,
+  and retrying only queues another prompt. Ordinary `op` errors (bad item name,
+  no permission) are labelled `none` and passed through untouched.
 - **Never logs `op`'s stdout/stderr.** Command output can contain secrets.
   The log only ever records the subcommand name, the exit code, and which
   known error pattern (if any) matched — nothing from `op` itself.
+
+Environment: `OP_SAFE_OP_TIMEOUT` (120s), `OP_SAFE_HEAL_COOLDOWN` (120s),
+`OP_SAFE_APP_BIN` / `OP_SAFE_APP_NAME` (the app to heal; override them to test
+the heal against a stub instead of the real 1Password).
 
 ### `bin/1password-bridge-heal.sh` + LaunchAgent — event-driven watchdog
 
